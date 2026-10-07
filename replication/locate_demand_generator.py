@@ -8,7 +8,8 @@ def generate_dual_locate_demand_lists(
         trade_date: str,
         matched_name: str,
         adjusted_notional: float,
-        output_dir: str = "./"
+        output_dir: str = "./",
+        strat_id: str = None
 ):
     """
     生成修正后的双口径外部询券清单:
@@ -91,7 +92,8 @@ def generate_dual_locate_demand_lists(
         'target_theoretical_qty': '理论需求股数', 'opt_qty': '模型已分配股数', 'internal_avail_qty': '内部底仓现有股数'
     })
 
-    output_filename = os.path.join(output_dir, f"Locate_Demand_List_{matched_name}_{trade_date}.xlsx")
+    prefix = f"{strat_id}_" if strat_id else ""
+    output_filename = f"./Locate_Demand_List_{prefix}{matched_name}_{trade_date}.xlsx"
     with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
         dashboard.to_excel(writer, sheet_name="询券方案对比总览", index=False)
         df_out_b.to_excel(writer, sheet_name="口径B_核心保底单", index=False)
