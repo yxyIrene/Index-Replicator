@@ -200,7 +200,7 @@ def load_all_indices_smart(
 
         for file_path in file_candidates:
             if os.path.exists(file_path):
-                print(f"📁 [{clean_date}] 成功命中共享盘权威 Index 文件: {os.path.basename(file_path)}")
+                print(f"📁 [{clean_date}] BBG Index file found: {os.path.basename(file_path)}")
                 try:
                     return load_all_indices_from_file(file_path)
                 except Exception as e:
@@ -208,7 +208,7 @@ def load_all_indices_smart(
                     break
 
     # 2. 兜底回退到数据库
-    print(f"🌐 [{clean_date}] 共享盘无当日文件，使用 TAICHI 数据库 (月末快照 + 动态价格漂移) 自动补全...")
+    print(f"🌐 [{clean_date}] 无当日指数文件，使用 TAICHI 数据库 (月末快照 + 动态价格漂移) 自动补全...")
     return load_all_indices_from_db(conn_str, clean_date)
 
 

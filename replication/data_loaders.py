@@ -1,59 +1,173 @@
 # replication/data_loaders.py
 import os
 import re
+import warnings
+from typing import Dict, List, Optional, Set
+
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
+from sqlalchemy.engine import Engine
+
 from parsers.parser_intraday_inventory import HTIIntradayInventoryParser
 
-def fetch_stock_market_cap_from_db(conn_str: str, stock_codes: list, trade_date: str) -> pd.DataFrame:
-    """提取个股历史/最新市值"""
-    engine = create_engine(conn_str)
-    formatted_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-    codes_str = "','".join(stock_codes)
-    query = text(f"""
+
+# =========================================================================
+# 0. 引擎缓存（模块级单例，避免每次 create_engine 重复建连接池）
+# =========================================================================
+_ENGINE_CACHE: Dict[str, Engine] = {}
+
+
+def get_engine(conn_str: str) -> Engine:
+    """复用 SQLAlchemy Engine。全项目统一从该函数取 Engine。"""
+    if conn_str not in _ENGINE_CACHE:
+        _ENGINE_CACHE[conn_str] = create_engine(
+            conn_str, pool_pre_ping=True, pool_size=10, max_overflow=20
+        )
+    return _ENGINE_CACHE[conn_str]
+
+
+# =========================================================================
+# 通用工具
+# =========================================================================
+def _fmt_date(trade_date: str) -> str:
+    """YYYYMMDD -> YYYY-MM-DD"""
+    return f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+
+
+def _to_6digit_codes(series: pd.Series) -> Set[str]:
+    """从任意格式的代码列中抽取 6 位数字代码集合"""
+    return set(
+        series.astype(str).str.extract(r'(\d{6})')[0]
+        .dropna().str.zfill(6).tolist()
+    )
+
+
+# =========================================================================
+# [新增] 停牌数据（A 股 / 港股统一表 md_stock_suspension）
+# =========================================================================
+def fetch_suspension_stocks_from_db(
+    conn_str: str,
+    trade_date: str,
+    exchange: Optional[str] = None,
+) -> Set[str]:
+    """
+    从 public.md_stock_suspension 获取指定交易日的停牌股票代码集合。
+
+    参数:
+        conn_str    : 数据库连接串
+        trade_date  : YYYYMMDD
+        exchange    : 可选，'SSE' / 'SZSE' / 'HKEX' 等；None 表示不过滤交易所
+
+    兜底策略（重要）:
+        该表可能只有近期数据，历史回测查不到数据 / 表不存在 / 连接异常时，
+        一律返回空集合并打印警告；下游依赖"行情价格缺失"作为兜底。
+    """
+    engine = get_engine(conn_str)
+    fmt_date = _fmt_date(trade_date)
+
+    sql = """
+        SELECT code, exchange, trade_status
+        FROM public.md_stock_suspension
+        WHERE trade_date = :trade_date
+    """
+    params: Dict[str, str] = {"trade_date": fmt_date}
+    if exchange:
+        sql += " AND exchange = :exchange"
+        params["exchange"] = exchange
+
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text(sql), conn, params=params)
+    except Exception as e:
+        warnings.warn(
+            f"⚠️ 获取 {trade_date} 停牌数据失败（历史数据缺失 / 表不存在 / 连接异常）: {e}；"
+            f"本次降级为空集，下游以行情价格缺失兜底。"
+        )
+        return set()
+
+    if df.empty:
+        return set()
+
+    # 仅保留明确标注"停牌"的记录
+    if 'trade_status' in df.columns:
+        df = df[df['trade_status'].astype(str).str.contains('停牌', na=False)]
+
+    return _to_6digit_codes(df['code'])
+
+
+# =========================================================================
+# 市值（参数化）
+# =========================================================================
+def fetch_stock_market_cap_from_db(
+    conn_str: str, stock_codes: List[str], trade_date: str
+) -> pd.DataFrame:
+    """提取个股历史/最新市值（SQL 参数化，避免注入）"""
+    engine = get_engine(conn_str)
+    fmt_date = _fmt_date(trade_date)
+
+    # 归一化代码
+    codes = [str(c).strip().zfill(6)[-6:] for c in stock_codes if str(c).strip()]
+    if not codes:
+        return pd.DataFrame(columns=['stock_code', 'market_cap'])
+
+    query = text("""
         WITH ranked_cap AS (
             SELECT code AS stock_code, market_cap, trade_date,
                    ROW_NUMBER() OVER(PARTITION BY code ORDER BY trade_date DESC) as rn
             FROM public.md_stock_rk_info
-            WHERE code IN ('{codes_str}')
-              AND trade_date <= TO_DATE('{formatted_date}', 'YYYY-MM-DD')
+            WHERE code IN :codes
+              AND trade_date <= :fmt_date
               AND market_cap IS NOT NULL
         )
         SELECT stock_code, market_cap FROM ranked_cap WHERE rn = 1;
-    """)
+    """).bindparams(bindparam('codes', expanding=True))
+
     with engine.connect() as conn:
-        df_cap = pd.read_sql(query, conn)
+        df_cap = pd.read_sql(
+            query, conn, params={"codes": codes, "fmt_date": fmt_date}
+        )
+
+    if df_cap.empty:
+        return pd.DataFrame(columns=['stock_code', 'market_cap'])
+
     df_cap['stock_code'] = df_cap['stock_code'].astype(str).str.zfill(6)
     df_cap['market_cap'] = pd.to_numeric(df_cap['market_cap'], errors='coerce')
     return df_cap
 
 
-def fetch_st_stocks_from_db(conn_str: str, trade_date: str) -> set:
+# =========================================================================
+# ST 标的（参数化）
+# =========================================================================
+def fetch_st_stocks_from_db(conn_str: str, trade_date: str) -> Set[str]:
     """提取 ST/*ST 标的"""
-    engine = create_engine(conn_str)
-    formatted_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-    query = text(f"""
+    engine = get_engine(conn_str)
+    fmt_date = _fmt_date(trade_date)
+
+    query = text("""
         WITH ranked_st AS (
             SELECT code, name, effective_date,
                    ROW_NUMBER() OVER(PARTITION BY code ORDER BY effective_date DESC) as rn
             FROM public.md_stock_st
-            WHERE effective_date <= TO_DATE('{formatted_date}', 'YYYY-MM-DD')
+            WHERE effective_date <= :fmt_date
         )
         SELECT code, name FROM ranked_st 
         WHERE rn = 1 AND (name LIKE '%ST%' OR name LIKE '%*ST%');
     """)
     try:
         with engine.connect() as conn:
-            df_st = pd.read_sql(query, conn)
+            df_st = pd.read_sql(query, conn, params={"fmt_date": fmt_date})
         if df_st.empty:
             return set()
-        return set(df_st['code'].astype(str).str.extract(r'(\d{6})')[0].dropna().str.zfill(6))
+        return _to_6digit_codes(df_st['code'])
     except Exception as e:
         print(f"⚠️ 从 md_stock_st 提取 ST 标的失败: {e}")
         return set()
 
 
+# =========================================================================
+# 以下为文件 I/O，行为不变
+# =========================================================================
 def load_jump_restriction_list(share_dir: str, trade_date: str) -> set:
     """从 Jump 共享盘读取限制名单"""
     if not os.path.exists(share_dir):
